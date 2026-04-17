@@ -38,6 +38,17 @@ st.set_page_config(
 
 GOIANIA_CENTER = [-16.6869, -49.2648]
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+BAIRROS_GEOJSON_PATH = os.path.join(DATA_DIR, "bairros_goiania.geojson")
+
+
+@st.cache_data(show_spinner=False)
+def carregar_bairros_builtin():
+    """Carrega o GeoJSON de bairros embutido no app (data/bairros_goiania.geojson)."""
+    try:
+        with open(BAIRROS_GEOJSON_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 CORES_MOTORISTAS = [
     "#e74c3c", "#2ecc71", "#3498db", "#f39c12", "#9b59b6",
@@ -1442,12 +1453,22 @@ with st.sidebar:
             "Arquivo GeoJSON", type=["geojson", "json"], key="upload_geojson",
             label_visibility="collapsed",
         )
+        # Carrega bairros embutidos automaticamente se ainda não carregado
+        if st.session_state.geojson_bairros_data is None:
+            _builtin = carregar_bairros_builtin()
+            if _builtin:
+                st.session_state.geojson_bairros_data = _builtin
+
         geojson_bairros = st.session_state.geojson_bairros_data
+        if geojson_bairros:
+            n_b = len(geojson_bairros.get("features", []))
+            st.success(f"✅ {n_b} bairros de Goiânia carregados automaticamente!")
+
         if arquivo_geojson:
             geojson_bairros = carregar_geojson_bairros(arquivo_geojson)
             if geojson_bairros:
                 st.session_state.geojson_bairros_data = geojson_bairros
-                st.success(f"{len(geojson_bairros.get('features', []))} poligonos!")
+                st.success(f"{len(geojson_bairros.get('features', []))} polígonos!")
 
         if st.button("Baixar Bairros (OSM)", use_container_width=True):
             with st.spinner("Baixando..."):
