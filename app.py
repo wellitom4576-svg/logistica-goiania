@@ -1,7 +1,7 @@
 """
-SKW COLETAS - Sistema de Roteirizacao e Coletas
-Goiania/GO - Roteirizacao profissional com OR-Tools, motoristas,
-bairros coloridos, e otimizacao avancada.
+SKW COLETAS v3.0 - Sistema de Roteirizacao e Coletas
+Goiania/GO - Roteirizacao profissional com OR-Tools, OSRM, Time Windows,
+banco de dados, historico, PDF, QR Code e multiplos depositos.
 """
 
 import streamlit as st
@@ -22,11 +22,29 @@ import zipfile
 import colorsys
 import os
 import math
+import sqlite3
+import urllib.request as _ureq
 from datetime import datetime, timedelta
 import urllib.parse
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+try:
+    import qrcode
+    from qrcode.image.styledpil import StyledPilImage
+    QR_OK = True
+except ImportError:
+    QR_OK = False
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm as rl_cm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    PDF_OK = True
+except ImportError:
+    PDF_OK = False
 
 # ── Config ──────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -39,6 +57,9 @@ st.set_page_config(
 GOIANIA_CENTER = [-16.6869, -49.2648]
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 BAIRROS_GEOJSON_PATH = os.path.join(DATA_DIR, "bairros_goiania.geojson")
+DB_PATH = os.path.join(DATA_DIR, "skw_coletas.db")
+OSRM_BASE = "http://router.project-osrm.org"
+OSRM_MAX_PONTOS = 100   # limite do servidor público
 
 
 @st.cache_data(show_spinner=False)
@@ -49,6 +70,340 @@ def carregar_bairros_builtin():
             return json.load(f)
     except Exception:
         return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BANCO DE DADOS SQLite
+# ══════════════════════════════════════════════════════════════════════════════
+
+def init_db():
+    """Inicializa o banco de dados SQLite."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS sessoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            data_criacao TEXT NOT NULL,
+            data_atualizacao TEXT NOT NULL,
+            dados_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS historico_rotas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sessao_id INTEGER,
+            data_rota TEXT NOT NULL,
+            resumo_json TEXT NOT NULL,
+            rotas_json TEXT NOT NULL,
+            total_km REAL,
+            total_coletas INTEGER,
+            custo_total REAL,
+            num_motoristas INTEGER
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+
+def db_salvar_sessao(nome, dados_json):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    agora = datetime.now().isoformat()
+    c.execute("INSERT INTO sessoes (nome, data_criacao, data_atualizacao, dados_json) VALUES (?,?,?,?)",
+              (nome, agora, agora, dados_json))
+    sessao_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return sessao_id
+
+
+def db_atualizar_sessao(sessao_id, dados_json):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE sessoes SET dados_json=?, data_atualizacao=? WHERE id=?",
+                 (dados_json, datetime.now().isoformat(), sessao_id))
+    conn.commit()
+    conn.close()
+
+
+def db_listar_sessoes():
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, nome, data_criacao, data_atualizacao FROM sessoes ORDER BY data_atualizacao DESC"
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def db_carregar_sessao(sessao_id):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT dados_json FROM sessoes WHERE id=?", (sessao_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def db_deletar_sessao(sessao_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM sessoes WHERE id=?", (sessao_id,))
+    conn.execute("DELETE FROM historico_rotas WHERE sessao_id=?", (sessao_id,))
+    conn.commit()
+    conn.close()
+
+
+def db_salvar_rota_historico(sessao_id, rotas, pontos_total):
+    conn = sqlite3.connect(DB_PATH)
+    total_km = sum(r["distancia_km"] for r in rotas)
+    total_col = sum(r["num_coletas"] for r in rotas)
+    custo = sum(r.get("custo_combustivel", 0) for r in rotas)
+    resumo = {
+        "motoristas": [r["motorista"] for r in rotas],
+        "total_km": total_km, "total_coletas": total_col,
+        "custo_total": custo, "num_motoristas": len(rotas),
+    }
+    conn.execute(
+        "INSERT INTO historico_rotas (sessao_id,data_rota,resumo_json,rotas_json,total_km,total_coletas,custo_total,num_motoristas) VALUES (?,?,?,?,?,?,?,?)",
+        (sessao_id, datetime.now().isoformat(), json.dumps(resumo),
+         json.dumps(rotas, ensure_ascii=False), total_km, total_col, custo, len(rotas)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_listar_historico(sessao_id=None):
+    conn = sqlite3.connect(DB_PATH)
+    if sessao_id:
+        rows = conn.execute(
+            "SELECT id,data_rota,total_km,total_coletas,custo_total,num_motoristas FROM historico_rotas WHERE sessao_id=? ORDER BY data_rota DESC",
+            (sessao_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id,data_rota,total_km,total_coletas,custo_total,num_motoristas FROM historico_rotas ORDER BY data_rota DESC LIMIT 50"
+        ).fetchall()
+    conn.close()
+    return rows
+
+
+def db_carregar_rota_historico(hist_id):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT rotas_json FROM historico_rotas WHERE id=?", (hist_id,)).fetchone()
+    conn.close()
+    return json.loads(row[0]) if row else None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OSRM — Distâncias reais por rua
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def osrm_matrix(pontos_coords):
+    """
+    Retorna matriz de distâncias (m) e durações (s) reais via OSRM.
+    pontos_coords: lista de (lat, lon)
+    Retorna (dist_matrix, dur_matrix) como np.array, ou None se falhar.
+    """
+    if len(pontos_coords) > OSRM_MAX_PONTOS:
+        return None, None
+    coords_str = ";".join(f"{lon},{lat}" for lat, lon in pontos_coords)
+    url = f"{OSRM_BASE}/table/v1/driving/{coords_str}?annotations=distance,duration"
+    try:
+        with _ureq.urlopen(url, timeout=15) as resp:
+            data = json.loads(resp.read())
+        if data.get("code") != "Ok":
+            return None, None
+        dist = np.array(data["distances"], dtype=float)
+        dur  = np.array(data["durations"], dtype=float)
+        return dist, dur
+    except Exception:
+        return None, None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def osrm_rota_geometria(pontos_coords):
+    """Retorna as coordenadas reais da rota (lista de [lat,lon]) via OSRM."""
+    if len(pontos_coords) < 2:
+        return []
+    coords_str = ";".join(f"{lon},{lat}" for lat, lon in pontos_coords)
+    url = f"{OSRM_BASE}/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
+    try:
+        with _ureq.urlopen(url, timeout=15) as resp:
+            data = json.loads(resp.read())
+        if data.get("code") != "Ok":
+            return []
+        geom = data["routes"][0]["geometry"]["coordinates"]
+        return [[lat, lon] for lon, lat in geom]
+    except Exception:
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QR CODE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def gerar_qr_ponto(ponto, ordem, motorista):
+    """Gera QR code PNG (bytes) com link de confirmação de coleta."""
+    if not QR_OK:
+        return None
+    texto = (
+        f"SKW COLETAS\n"
+        f"#{ordem} - {ponto.get('nome','')}\n"
+        f"Endereço: {ponto.get('endereco','')}\n"
+        f"Motorista: {motorista}\n"
+        f"Maps: https://www.google.com/maps?q={ponto['lat']},{ponto['lon']}"
+    )
+    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=3)
+    qr.add_data(texto)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="#0a1628", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PDF PROFISSIONAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def gerar_pdf_roteiro(rotas, hora_inicio, vel_media, tempo_parada):
+    """Gera PDF profissional do roteiro com ReportLab."""
+    if not PDF_OK:
+        return None
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        rightMargin=1.5*rl_cm, leftMargin=1.5*rl_cm,
+        topMargin=2*rl_cm, bottomMargin=1.5*rl_cm,
+    )
+    styles = getSampleStyleSheet()
+    AZUL = rl_colors.HexColor("#0a1628")
+    AZUL_CL = rl_colors.HexColor("#3498db")
+    VERDE = rl_colors.HexColor("#2ecc71")
+    CINZA = rl_colors.HexColor("#f0f2f6")
+
+    story = []
+
+    # Cabeçalho
+    tit_style = ParagraphStyle("tit", parent=styles["Title"],
+                                textColor=rl_colors.white, fontSize=18,
+                                fontName="Helvetica-Bold", alignment=TA_CENTER)
+    sub_style = ParagraphStyle("sub", parent=styles["Normal"],
+                                textColor=rl_colors.HexColor("#aaaaaa"),
+                                fontSize=9, alignment=TA_CENTER)
+    header_data = [[Paragraph("<font color='white' size=20>📦 SKW COLETAS</font>", styles["Title"]),]]
+    header_tbl = Table(header_data, colWidths=[doc.width])
+    header_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), AZUL),
+        ("ROUNDEDCORNERS", [8]),
+        ("TOPPADDING", (0,0), (-1,-1), 12),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 12),
+    ]))
+    story.append(header_tbl)
+    story.append(Spacer(1, 0.3*rl_cm))
+
+    # Subtítulo
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+    story.append(Paragraph(
+        f"<b>Roteiro do Dia</b> — Gerado em {now_str} | Saída: {hora_inicio}",
+        ParagraphStyle("sub2", parent=styles["Normal"], fontSize=10, textColor=rl_colors.HexColor("#555555"))
+    ))
+    story.append(Spacer(1, 0.4*rl_cm))
+
+    # Resumo geral
+    dist_total = sum(r["distancia_km"] for r in rotas)
+    col_total  = sum(r["num_coletas"] for r in rotas)
+    custo_total= sum(r.get("custo_combustivel",0) for r in rotas)
+    tempo_total= sum(estimar_tempo_rota(r["distancia_km"],r["num_coletas"],vel_media,tempo_parada) for r in rotas)
+
+    resumo_rows = [
+        ["Motoristas", "Coletas", "Distância Total", "Custo Total", "Tempo Est."],
+        [str(len(rotas)), str(col_total), f"{dist_total:.1f} km",
+         f"R$ {custo_total:.2f}", formatar_tempo(tempo_total)],
+    ]
+    rt = Table(resumo_rows, colWidths=[doc.width/5]*5)
+    rt.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), AZUL_CL),
+        ("TEXTCOLOR", (0,0), (-1,0), rl_colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+        ("ALIGN", (0,0), (-1,-1), "CENTER"),
+        ("BACKGROUND", (0,1), (-1,1), CINZA),
+        ("GRID", (0,0), (-1,-1), 0.5, rl_colors.HexColor("#dddddd")),
+        ("ROUNDEDCORNERS", [4]),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(rt)
+    story.append(Spacer(1, 0.5*rl_cm))
+    story.append(HRFlowable(width="100%", thickness=1, color=AZUL_CL))
+    story.append(Spacer(1, 0.3*rl_cm))
+
+    # Roteiro por motorista
+    CORES_MOT_RL = [
+        rl_colors.HexColor(c.lstrip("#")) for c in
+        ["#e74c3c","#2ecc71","#3498db","#f39c12","#9b59b6",
+         "#1abc9c","#e67e22","#e84393","#00b894","#6c5ce7"]
+    ]
+    for v_idx, r in enumerate(rotas):
+        cor_mot = CORES_MOT_RL[v_idx % len(CORES_MOT_RL)]
+        etas = calcular_etas(r["paradas"], hora_inicio, vel_media, tempo_parada)
+        tempo_est = estimar_tempo_rota(r["distancia_km"], r["num_coletas"], vel_media, tempo_parada)
+
+        # Cabeçalho do motorista
+        mot_info = (f"<b><font color='white'> {r['motorista'].upper()}</font></b>  "
+                    f"<font color='#dddddd' size=8>{r['num_coletas']} coletas · "
+                    f"{r['distancia_km']} km · R$ {r.get('custo_combustivel',0):.2f} · "
+                    f"{formatar_tempo(tempo_est)}</font>")
+        mot_tbl = Table([[Paragraph(mot_info, styles["Normal"])]],
+                        colWidths=[doc.width])
+        mot_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), cor_mot),
+            ("TOPPADDING", (0,0), (-1,-1), 7),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 7),
+            ("LEFTPADDING", (0,0), (-1,-1), 10),
+            ("ROUNDEDCORNERS", [6]),
+        ]))
+        story.append(mot_tbl)
+        story.append(Spacer(1, 0.15*rl_cm))
+
+        # Tabela de paradas
+        col_w = [0.8*rl_cm, 1.4*rl_cm, 5.5*rl_cm, 5.5*rl_cm, 1.5*rl_cm, 1.7*rl_cm]
+        header = ["#", "Horário", "Local", "Endereço", "Trecho", "Acumulado"]
+        rows = [header]
+        for pi, (p, eta) in enumerate(zip(r["paradas"], etas)):
+            trecho = f"{p.get('dist_trecho_km',0)} km" if p["ordem"] > 0 else "—"
+            acum   = f"{p.get('dist_acumulada_km',0):.1f} km"
+            rows.append([str(p["ordem"]), eta,
+                         p["nome"][:35], p.get("endereco","")[:35],
+                         trecho, acum])
+
+        col_widths_sum = sum(col_w)
+        scale = doc.width / col_widths_sum
+        col_w_scaled = [w * scale for w in col_w]
+
+        pt = Table(rows, colWidths=col_w_scaled, repeatRows=1)
+        style_cmds = [
+            ("BACKGROUND", (0,0), (-1,0), AZUL),
+            ("TEXTCOLOR", (0,0), (-1,0), rl_colors.white),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 7.5),
+            ("ALIGN", (0,0), (1,-1), "CENTER"),
+            ("ALIGN", (4,0), (-1,-1), "CENTER"),
+            ("GRID", (0,0), (-1,-1), 0.3, rl_colors.HexColor("#cccccc")),
+            ("TOPPADDING", (0,0), (-1,-1), 4),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [rl_colors.white, CINZA]),
+        ]
+        # Destaca base (linha 1 e última)
+        for row_i in [1, len(rows)-1]:
+            style_cmds.append(("BACKGROUND", (0,row_i), (-1,row_i), rl_colors.HexColor("#fffde7")))
+            style_cmds.append(("FONTNAME", (0,row_i), (-1,row_i), "Helvetica-Bold"))
+        pt.setStyle(TableStyle(style_cmds))
+        story.append(pt)
+        story.append(Spacer(1, 0.5*rl_cm))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
 
 CORES_MOTORISTAS = [
     "#e74c3c", "#2ecc71", "#3498db", "#f39c12", "#9b59b6",
@@ -98,12 +453,19 @@ def init_state():
         "status_pontos": {},          # {p_idx: "pendente"|"coletado"|"falhou"|"reagendado"}
         "num_pacotes": {},            # {p_idx: int}
         "capacidade_veiculos": {},    # {m_idx: int}  (0 = sem limite)
+        "usar_osrm": True,
+        "time_windows": {},           # {p_idx: {"abre": float|None, "fecha": float|None}}
+        "sessao_db_id": None,         # ID da sessão no SQLite
+        "sessao_nome": "Nova Sessão",
+        "usar_multiplos_depositos": False,
+        "deposito_por_motorista": {},  # {m_idx: ponto_idx}  (ponto 0 = base padrão)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 init_state()
+init_db()
 
 
 # ── Funcoes Utilitarias ────────────────────────────────────────────────────
@@ -660,16 +1022,37 @@ def criar_convex_hull(pontos_coords):
 
 def otimizar_rota(pontos, num_veiculos=1, deposito=0, max_dist_km=300,
                   balancear=True, preco_litro=6.29, km_por_litro=10.0,
-                  tempo_busca_seg=15, capacidades=None, demandas=None):
+                  tempo_busca_seg=15, capacidades=None, demandas=None,
+                  usar_osrm=True, time_windows=None, depositos_lista=None):
     if len(pontos) < 2:
         return None
 
-    matriz = calcular_matriz_distancias(pontos)
+    # ── Matriz de distâncias: OSRM (real) ou geodésica (fallback) ──────────
+    dur_matrix = None
+    if usar_osrm and len(pontos) <= OSRM_MAX_PONTOS:
+        coords = [(p["lat"], p["lon"]) for p in pontos]
+        dist_osrm, dur_osrm = osrm_matrix(tuple(coords))
+        if dist_osrm is not None:
+            matriz = dist_osrm
+            dur_matrix = dur_osrm
+        else:
+            matriz = calcular_matriz_distancias(pontos)
+    else:
+        matriz = calcular_matriz_distancias(pontos)
+
     dists_flat = matriz[matriz > 0]
     mediana_dist = float(np.median(dists_flat)) if len(dists_flat) > 0 else 5000
     limiar = mediana_dist * 1.2
 
-    manager = pywrapcp.RoutingIndexManager(len(pontos), num_veiculos, deposito)
+    # ── Múltiplos depósitos ────────────────────────────────────────────────
+    if depositos_lista and len(depositos_lista) == num_veiculos:
+        starts = depositos_lista
+        ends   = depositos_lista
+    else:
+        starts = [deposito] * num_veiculos
+        ends   = [deposito] * num_veiculos
+
+    manager = pywrapcp.RoutingIndexManager(len(pontos), num_veiculos, starts, ends)
     routing = pywrapcp.RoutingModel(manager)
 
     def distance_callback(from_index, to_index):
@@ -707,6 +1090,25 @@ def otimizar_rota(pontos, num_veiculos=1, deposito=0, max_dist_km=300,
             [int(c) if c and c > 0 else 999999 for c in capacidades],
             True, "Capacity",
         )
+
+    # ── Time Windows (VRPTW) ───────────────────────────────────────────────
+    if time_windows and dur_matrix is not None:
+        def time_callback(from_idx, to_idx):
+            f = manager.IndexToNode(from_idx)
+            t = manager.IndexToNode(to_idx)
+            service = int(TEMPO_MEDIO_COLETA_MIN * 60) if f != deposito else 0
+            return int(dur_matrix[f][t]) + service
+        tc_idx = routing.RegisterTransitCallback(time_callback)
+        MAX_TIME = 12 * 3600  # 12 horas
+        routing.AddDimension(tc_idx, 3600, MAX_TIME, False, "Time")
+        time_dim = routing.GetDimensionOrDie("Time")
+        for node_i, (t_min, t_max) in enumerate(time_windows):
+            if t_min is None and t_max is None:
+                continue
+            idx = manager.NodeToIndex(node_i)
+            t_lo = int(t_min * 3600) if t_min is not None else 0
+            t_hi = int(t_max * 3600) if t_max is not None else MAX_TIME
+            time_dim.CumulVar(idx).SetRange(t_lo, t_hi)
 
     best_solution = None
     best_cost = float("inf")
@@ -1618,6 +2020,68 @@ with st.sidebar:
         )
         st.caption("Usado para calcular horários estimados em cada parada.")
 
+    with st.expander("🛣️ Configurações Avançadas de Rota"):
+        st.session_state.usar_osrm = st.toggle(
+            "🛣️ Distâncias reais por rua (OSRM)",
+            value=st.session_state.usar_osrm,
+            help="Usa o OpenStreetMap/OSRM para calcular distâncias reais no trânsito. "
+                 "Mais preciso que linha reta. Requer internet. Limite: 100 pontos.",
+        )
+        if st.session_state.usar_osrm:
+            st.caption("✅ OSRM ativo — distâncias por rua reais")
+        else:
+            st.caption("⚠️ Modo geodésico (linha reta) — menos preciso")
+
+        st.session_state.usar_multiplos_depositos = st.toggle(
+            "🏭 Múltiplos depósitos (bases diferentes por motorista)",
+            value=st.session_state.usar_multiplos_depositos,
+        )
+
+    with st.expander("💾 Sessão (Banco de Dados)"):
+        st.caption("Salve no banco local para não perder entre sessões.")
+        nome_sessao = st.text_input("Nome da sessão", value=st.session_state.sessao_nome,
+                                    key="nome_sessao_sb")
+        s1, s2 = st.columns(2)
+        with s1:
+            if st.button("💾 Salvar Sessão", use_container_width=True, type="primary"):
+                st.session_state.sessao_nome = nome_sessao
+                dados = salvar_sessao()
+                if st.session_state.sessao_db_id:
+                    db_atualizar_sessao(st.session_state.sessao_db_id, dados)
+                    st.success("Sessão atualizada!")
+                else:
+                    sid = db_salvar_sessao(nome_sessao, dados)
+                    st.session_state.sessao_db_id = sid
+                    st.success(f"Sessão salva! ID: {sid}")
+        with s2:
+            if st.button("📤 Exportar JSON", use_container_width=True):
+                st.download_button("⬇️ Baixar",
+                    salvar_sessao(),
+                    f"skw_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                    "application/json", use_container_width=True)
+
+        sessoes = db_listar_sessoes()
+        if sessoes:
+            st.markdown("**Sessões salvas:**")
+            for sid, snome, scr, sat in sessoes[:8]:
+                cr_fmt = scr[:16].replace("T", " ")
+                sc1, sc2, sc3 = st.columns([3, 1, 1])
+                with sc1:
+                    st.caption(f"**{snome}** ({cr_fmt})")
+                with sc2:
+                    if st.button("📂", key=f"load_s_{sid}", help="Carregar"):
+                        dados = db_carregar_sessao(sid)
+                        ok, msg = carregar_sessao(dados)
+                        if ok:
+                            st.session_state.sessao_db_id = sid
+                            st.session_state.sessao_nome = snome
+                            st.success(msg)
+                            st.rerun()
+                with sc3:
+                    if st.button("🗑️", key=f"del_s_{sid}", help="Apagar"):
+                        db_deletar_sessao(sid)
+                        st.rerun()
+
     with st.expander("💾 Salvar / Carregar Sessão"):
         st.caption("Salve todo o trabalho (pontos, motoristas, atribuições) em um arquivo JSON.")
         if st.button("💾 Baixar Sessão Atual", use_container_width=True):
@@ -1749,9 +2213,9 @@ else:
 # ══════════════════════════════════════════════════════════════════════════════
 # ABAS
 # ══════════════════════════════════════════════════════════════════════════════
-tab_mapa, tab_rota, tab_motoristas, tab_bairros, tab_pontos, tab_agenda, tab_status, tab_relatorio = st.tabs([
+tab_mapa, tab_rota, tab_motoristas, tab_bairros, tab_pontos, tab_agenda, tab_status, tab_historico, tab_relatorio = st.tabs([
     "🗺️ Mapa", "🚀 Roteirização", "👷 Motoristas",
-    "🏘️ Bairros", "📍 Pontos", "📅 Agenda", "📊 Status", "📋 Relatório",
+    "🏘️ Bairros", "📍 Pontos", "📅 Agenda", "📊 Status", "📚 Histórico", "📋 Relatório",
 ])
 
 
@@ -1824,8 +2288,10 @@ with tab_mapa:
 # TAB ROTEIRIZACAO
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_rota:
-    st.markdown('<div class="section-title">Roteirizacao SKW</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-subtitle">OR-Tools + 2-opt + Or-opt | Penalidade cubica | Multi-estrategia</div>', unsafe_allow_html=True)
+    _osrm_on = st.session_state.usar_osrm
+    _osrm_label = "🛣️ OSRM (ruas reais)" if _osrm_on else "📐 Geodésico (linha reta)"
+    st.markdown(f'<div class="section-title">Roteirização SKW</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="section-subtitle">OR-Tools + 2-opt + Or-opt | {_osrm_label} | Time Windows | CVRP</div>', unsafe_allow_html=True)
 
     if len(st.session_state.pontos_coleta) < 2:
         st.warning("Adicione pelo menos 2 pontos para otimizar.")
@@ -1843,7 +2309,40 @@ with tab_rota:
         with col_bal:
             balancear = st.checkbox("Balancear carga", value=True)
 
-        if st.button("OTIMIZAR ROTAS", type="primary", use_container_width=True):
+        # ── Time Windows ─────────────────────────────────────────────────
+        with st.expander("⏰ Janelas de Tempo por Ponto (opcional)"):
+            st.caption("Defina horário de abertura/fechamento para cada ponto de coleta. "
+                       "O OR-Tools só visitará no período permitido.")
+            nova_tw = dict(st.session_state.time_windows)
+            for p_idx, p in enumerate(st.session_state.pontos_coleta[:20]):
+                tw = st.session_state.time_windows.get(p_idx, {})
+                tw_c1, tw_c2, tw_c3 = st.columns([3, 1, 1])
+                with tw_c1:
+                    st.caption(f"#{p_idx+1} {p.get('nome','')[:35]}")
+                with tw_c2:
+                    abre = st.number_input(
+                        "Abre (h)", min_value=0.0, max_value=23.5, step=0.5,
+                        value=float(tw.get("abre", 8.0)),
+                        key=f"tw_abre_{p_idx}", label_visibility="collapsed",
+                    )
+                with tw_c3:
+                    fecha = st.number_input(
+                        "Fecha (h)", min_value=0.0, max_value=23.5, step=0.5,
+                        value=float(tw.get("fecha", 18.0)),
+                        key=f"tw_fecha_{p_idx}", label_visibility="collapsed",
+                    )
+                nova_tw[p_idx] = {"abre": abre, "fecha": fecha}
+            if len(st.session_state.pontos_coleta) > 20:
+                st.caption(f"... e mais {len(st.session_state.pontos_coleta)-20} pontos (sem janela)")
+            if st.button("Salvar Janelas de Tempo", use_container_width=True):
+                st.session_state.time_windows = nova_tw
+                st.success("Janelas salvas!")
+
+        usar_tw = bool(st.session_state.time_windows)
+        if usar_tw:
+            st.info(f"⏰ {len(st.session_state.time_windows)} janelas de tempo ativas")
+
+        if st.button("🚀 OTIMIZAR ROTAS", type="primary", use_container_width=True):
             with st.spinner("Calculando rotas otimizadas... Aguarde."):
                 if modo_rota == "Por motorista (usa atribuicao)":
                     if not st.session_state.atribuicao_motorista:
@@ -1868,6 +2367,7 @@ with tab_rota:
                                 pontos_mot, 1, deposito=0, max_dist_km=max_dist,
                                 balancear=False, preco_litro=preco_litro,
                                 km_por_litro=km_por_litro, tempo_busca_seg=tempo_busca,
+                                usar_osrm=st.session_state.usar_osrm,
                             )
                             if resultado:
                                 r = resultado[0]
@@ -1899,10 +2399,29 @@ with tab_rota:
                             st.error("Nenhuma rota encontrada.")
                 else:
                     todos_pontos = [{"lat": base_lat, "lon": base_lon, "nome": "BASE SKW"}] + st.session_state.pontos_coleta
+                    # Constrói time_windows para lista global de pontos
+                    tw_global = None
+                    if usar_tw and st.session_state.time_windows:
+                        hora_s = st.session_state.hora_inicio
+                        try:
+                            h0, m0 = map(int, hora_s.split(":"))
+                            offset_h = h0 + m0/60
+                        except Exception:
+                            offset_h = 7.5
+                        tw_global = [(None, None)] * len(todos_pontos)
+                        for p_idx, tw in st.session_state.time_windows.items():
+                            real_idx = p_idx + 1
+                            if real_idx < len(tw_global):
+                                abre_rel = max(0.0, tw["abre"] - offset_h)
+                                fecha_rel = max(0.0, tw["fecha"] - offset_h)
+                                tw_global[real_idx] = (abre_rel * 3600, fecha_rel * 3600)
+
                     resultado = otimizar_rota(
                         todos_pontos, num_mot, deposito=0, max_dist_km=max_dist,
                         balancear=balancear, preco_litro=preco_litro,
                         km_por_litro=km_por_litro, tempo_busca_seg=tempo_busca,
+                        usar_osrm=st.session_state.usar_osrm,
+                        time_windows=tw_global,
                     )
                     if resultado:
                         for i, r in enumerate(resultado):
@@ -2047,6 +2566,25 @@ with tab_rota:
                     } for pi, p in enumerate(r["paradas"])])
                     st.dataframe(df_paradas, use_container_width=True, hide_index=True)
 
+            # ── Salvar no histórico ────────────────────────────────────────
+            col_hist1, col_hist2 = st.columns(2)
+            with col_hist1:
+                if st.button("📚 Salvar no Histórico", use_container_width=True, type="secondary"):
+                    sid = st.session_state.get("sessao_db_id")
+                    if not sid:
+                        dados = salvar_sessao()
+                        sid = db_salvar_sessao(
+                            st.session_state.get("sessao_nome", "Sessão"),
+                            dados
+                        )
+                        st.session_state.sessao_db_id = sid
+                    db_salvar_rota_historico(sid, rotas, len(todos_pontos))
+                    st.success("✅ Rota salva no histórico!")
+            with col_hist2:
+                if st.button("🔄 Limpar Rotas", type="secondary", use_container_width=True):
+                    st.session_state.rota_otimizada = None
+                    st.rerun()
+
             # Exportacao
             st.markdown('<div class="section-title">Exportar</div>', unsafe_allow_html=True)
             hora_exp = st.session_state.hora_inicio
@@ -2114,9 +2652,45 @@ with tab_rota:
                     help="Baixe e abra no navegador para imprimir",
                 )
 
-            if st.button("Limpar Rotas", type="secondary"):
-                st.session_state.rota_otimizada = None
-                st.rerun()
+            # ── PDF + QR Code ─────────────────────────────────────────────
+            pdf_col, qr_col = st.columns(2)
+            with pdf_col:
+                if PDF_OK:
+                    pdf_bytes = gerar_pdf_roteiro(rotas, hora_exp, vel_exp, t_exp)
+                    if pdf_bytes:
+                        st.download_button(
+                            "📄 PDF Profissional",
+                            pdf_bytes,
+                            f"skw_roteiro_{datetime.now().strftime('%Y%m%d')}.pdf",
+                            "application/pdf",
+                            use_container_width=True,
+                        )
+                else:
+                    st.caption("📄 PDF: instale `reportlab`")
+
+            with qr_col:
+                if QR_OK:
+                    if st.button("📱 Gerar QR Codes (ZIP)", use_container_width=True):
+                        qr_buf = io.BytesIO()
+                        with zipfile.ZipFile(qr_buf, "w") as zf:
+                            for r in rotas:
+                                for p in r["paradas"]:
+                                    if p["ordem"] == 0:
+                                        continue
+                                    qr_bytes = gerar_qr_ponto(p, p["ordem"], r["motorista"])
+                                    if qr_bytes:
+                                        fname = f"{r['motorista']}/{p['ordem']:02d}_{p['nome'][:30].replace(' ','_')}.png"
+                                        zf.writestr(fname, qr_bytes)
+                        st.download_button(
+                            "⬇️ Baixar QR Codes",
+                            qr_buf.getvalue(),
+                            "skw_qrcodes.zip",
+                            "application/zip",
+                            use_container_width=True,
+                        )
+                else:
+                    st.caption("📱 QR: instale `qrcode[pil]`")
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2794,6 +3368,101 @@ with tab_status:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TAB HISTÓRICO
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_historico:
+    st.markdown('<div class="section-title">Histórico de Rotas</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Todas as rotas otimizadas e salvas no banco de dados local</div>', unsafe_allow_html=True)
+
+    hist_rows = db_listar_historico()
+    if not hist_rows:
+        st.info("Nenhuma rota no histórico ainda. Otimize e clique em **Salvar no Histórico** na aba Roteirização.")
+    else:
+        # KPIs do histórico
+        df_hist = pd.DataFrame(hist_rows, columns=["ID","Data","Km","Coletas","Custo R$","Motoristas"])
+        df_hist["Data"] = df_hist["Data"].str[:16].str.replace("T"," ")
+
+        h1,h2,h3,h4 = st.columns(4)
+        with h1: st.metric("Total de rotas", len(df_hist))
+        with h2: st.metric("Total de km", f"{df_hist['Km'].sum():.0f} km")
+        with h3: st.metric("Total de coletas", int(df_hist["Coletas"].sum()))
+        with h4: st.metric("Custo total", f"R$ {df_hist['Custo R$'].sum():.2f}")
+
+        st.divider()
+
+        # Tabela do histórico com botões de ação
+        st.dataframe(
+            df_hist.style.format({"Km": "{:.1f}", "Custo R$": "R$ {:.2f}"}),
+            use_container_width=True, hide_index=True,
+        )
+
+        # Detalhes de uma rota específica
+        hist_ids = [row[0] for row in hist_rows]
+        sel_hist = st.selectbox(
+            "Ver detalhes de uma rota",
+            options=[None] + hist_ids,
+            format_func=lambda x: "-- selecione --" if x is None else
+                f"#{x} — {next((r[1][:16].replace('T',' ') for r in hist_rows if r[0]==x), '')}",
+            key="sel_hist_detail",
+        )
+        if sel_hist:
+            rotas_hist = db_carregar_rota_historico(sel_hist)
+            if rotas_hist:
+                hora_hist = "07:30"
+                vel_hist = st.session_state.velocidade_media
+                t_hist = st.session_state.tempo_coleta_min
+
+                st.markdown('<div class="section-title">Detalhes da Rota Selecionada</div>', unsafe_allow_html=True)
+                for r in rotas_hist:
+                    etas_h = calcular_etas(r.get("paradas",[]), hora_hist, vel_hist, t_hist)
+                    tempo_h = estimar_tempo_rota(r["distancia_km"], r["num_coletas"], vel_hist, t_hist)
+                    st.markdown(f"""
+                    <div class="rota-header-card" style="border-left-color:{r.get('cor','#3498db')}">
+                        <div class="rota-icon">🚚</div>
+                        <div class="rota-info">
+                            <div class="rota-name">{r['motorista']}</div>
+                            <div class="rota-stats">{r['num_coletas']} coletas · {r['distancia_km']} km · R$ {r.get('custo_combustivel',0):.2f} · {formatar_tempo(tempo_h)}</div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                # Exportar histórico
+                exp_h1, exp_h2 = st.columns(2)
+                with exp_h1:
+                    all_rows_h = []
+                    for r in rotas_hist:
+                        etas_h2 = calcular_etas(r.get("paradas",[]), hora_hist, vel_hist, t_hist)
+                        for pi, p in enumerate(r.get("paradas",[])):
+                            all_rows_h.append({
+                                "Motorista": r["motorista"],
+                                "Ordem": p["ordem"],
+                                "Horário": etas_h2[pi] if pi < len(etas_h2) else "-",
+                                "Local": p["nome"],
+                                "Endereço": p.get("endereco",""),
+                                "Km": p.get("dist_acumulada_km",0),
+                            })
+                    st.download_button("📄 Exportar CSV",
+                        pd.DataFrame(all_rows_h).to_csv(index=False),
+                        f"historico_{sel_hist}.csv", "text/csv", use_container_width=True)
+                with exp_h2:
+                    if PDF_OK:
+                        pdf_h = gerar_pdf_roteiro(rotas_hist, hora_hist, vel_hist, t_hist)
+                        if pdf_h:
+                            st.download_button("📄 Exportar PDF", pdf_h,
+                                f"historico_{sel_hist}.pdf", "application/pdf", use_container_width=True)
+
+        # Limpar histórico
+        st.divider()
+        if st.button("🗑️ Limpar Todo o Histórico", type="secondary"):
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("DELETE FROM historico_rotas")
+            conn.commit()
+            conn.close()
+            st.success("Histórico limpo!")
+            st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TAB RELATORIO
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_relatorio:
@@ -2873,10 +3542,11 @@ with tab_relatorio:
 # ══════════════════════════════════════════════════════════════════════════════
 # FOOTER
 # ══════════════════════════════════════════════════════════════════════════════
+_osrm_status = "🛣️ OSRM Ativo" if st.session_state.usar_osrm else "📐 Modo Geodésico"
 st.markdown(f"""
 <div class="footer-pro">
-    <b>SKW COLETAS v2.0</b> &bull; Sistema Profissional de Roteirização e Coletas &bull; Goiânia/GO<br>
-    OR-Tools + 2-opt + Or-opt &bull; CVRP (Capacidade) &bull; ETAs por Parada &bull; Export Excel/PDF &bull; Agenda &bull; Status em Tempo Real<br>
-    <span style="color:#bdc3c7">Streamlit &bull; Folium &bull; OpenPyXL &bull; GeoPy &bull; Shapely</span>
+    <b>SKW COLETAS v3.0</b> &bull; Sistema Profissional de Roteirização &bull; Goiânia/GO<br>
+    OR-Tools · OSRM (Ruas Reais) · Time Windows · CVRP · SQLite · PDF · QR Code · Histórico · 328 Bairros<br>
+    <span style="color:#bdc3c7">{_osrm_status} &bull; Streamlit &bull; ReportLab &bull; OpenPyXL &bull; Folium &bull; Shapely</span>
 </div>
 """, unsafe_allow_html=True)

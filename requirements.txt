@@ -8,3 +8,6 @@ shapely>=2.0.0
 ortools>=9.8
 branca>=0.7.0
 openpyxl>=3.1.0
+qrcode[pil]>=7.4
+reportlab>=4.0.0
+Pillow>=9.0.0
