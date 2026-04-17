@@ -1400,53 +1400,169 @@ with st.sidebar:
             else:
                 st.error("Endereco nao encontrado")
 
-    with st.expander("Importar Pontos", expanded=not bool(n_pts)):
+    with st.expander("📥 Importar Pontos (Planilha)", expanded=not bool(n_pts)):
+        st.caption("Aceita **qualquer planilha** — o app detecta as colunas automaticamente. "
+                   "Se não encontrar lat/lon, geocodifica pelo endereço.")
         arquivo_pontos = st.file_uploader(
-            "CSV, XLSX ou JSON", type=["csv", "xlsx", "xls", "json"],
+            "CSV, XLSX, XLS ou JSON — qualquer formato",
+            type=["csv", "xlsx", "xls", "json"],
             key="upload_pontos", label_visibility="collapsed",
         )
         if arquivo_pontos:
             try:
+                # ── Carrega dataframe
                 if arquivo_pontos.name.endswith(".csv"):
-                    df = pd.read_csv(arquivo_pontos)
+                    # Tenta detectar separador automaticamente
+                    raw = arquivo_pontos.read()
+                    for sep in [",", ";", "\t", "|"]:
+                        try:
+                            import io as _io
+                            df = pd.read_csv(_io.BytesIO(raw), sep=sep)
+                            if len(df.columns) > 1:
+                                break
+                        except Exception:
+                            continue
                 elif arquivo_pontos.name.endswith((".xlsx", ".xls")):
                     df = pd.read_excel(arquivo_pontos)
                 else:
                     df = pd.DataFrame(json.loads(arquivo_pontos.read().decode("utf-8")))
+
+                # ── Mapeamento flexível de colunas ─────────────────────────
+                ALIASES = {
+                    "lat":       ["lat","latitude","latitude_decimal","y","lat_","latit"],
+                    "lon":       ["lon","longitude","lng","long","x","lon_","longi","longitude_decimal"],
+                    "nome":      ["nome","name","local","ponto","cliente","destinatario","destinatário",
+                                  "estabelecimento","razao_social","razão_social","empresa","loja"],
+                    "endereco":  ["endereco","endereço","address","logradouro","rua","end","endereço_completo",
+                                  "end_completo","endereço completo","rua_numero","localidade"],
+                    "obs":       ["obs","observacao","observação","observacoes","observações","nota","notas",
+                                  "descricao","descrição","detalhe","detalhes","complemento"],
+                    "prioridade":["prioridade","priority","urgencia","urgência","nivel","nível"],
+                    "cep":       ["cep","zip","zipcode","cod_postal","codigo_postal","postal"],
+                    "telefone":  ["telefone","tel","fone","celular","whatsapp","contato"],
+                }
+
                 col_map = {}
-                for col in df.columns:
-                    cl = col.lower().strip()
-                    if cl in ("latitude", "lat"):
-                        col_map[col] = "lat"
-                    elif cl in ("longitude", "lon", "lng", "long"):
-                        col_map[col] = "lon"
-                    elif cl in ("nome", "name", "local"):
-                        col_map[col] = "nome"
-                    elif cl in ("endereco", "endereço", "address"):
-                        col_map[col] = "endereco"
-                    elif cl in ("obs", "observacao", "observação", "nota"):
-                        col_map[col] = "obs"
-                    elif cl in ("prioridade", "priority"):
-                        col_map[col] = "prioridade"
-                df = df.rename(columns=col_map)
-                if "lat" in df.columns and "lon" in df.columns:
-                    pontos_importados = []
-                    for _, row in df.iterrows():
-                        pontos_importados.append({
-                            "lat": float(row["lat"]),
-                            "lon": float(row["lon"]),
-                            "nome": str(row.get("nome", "")),
-                            "endereco": str(row.get("endereco", "")),
-                            "obs": str(row.get("obs", "")),
-                            "prioridade": str(row.get("prioridade", "Normal")),
-                        })
-                    st.success(f"{len(pontos_importados)} pontos importados!")
-                    st.session_state.pontos_coleta = pontos_importados
-                    st.session_state.atribuicao_motorista = {}
-                else:
-                    st.error("Colunas 'lat' e 'lon' nao encontradas.")
+                cols_lower = {c: c.lower().strip().replace(" ", "_") for c in df.columns}
+                for col, col_l in cols_lower.items():
+                    for campo, aliases in ALIASES.items():
+                        if col_l in aliases and campo not in col_map.values():
+                            col_map[col] = campo
+                            break
+
+                df_mapped = df.rename(columns=col_map)
+
+                # ── Preview + mapeamento manual ────────────────────────────
+                st.markdown("**Preview das primeiras 3 linhas:**")
+                st.dataframe(df.head(3), use_container_width=True)
+                st.markdown(f"**Colunas detectadas:** {col_map if col_map else '(nenhuma reconhecida)'}")
+
+                tem_coords = "lat" in df_mapped.columns and "lon" in df_mapped.columns
+                tem_end = "endereco" in df_mapped.columns or "cep" in df_mapped.columns
+
+                if not tem_coords and not tem_end:
+                    st.warning("⚠️ Não foi possível detectar colunas de coordenadas ou endereço. "
+                               "Mapeie manualmente:")
+                    all_cols = ["-- ignorar --"] + list(df.columns)
+                    manual_map = {}
+                    for campo in ["lat", "lon", "nome", "endereco", "obs", "prioridade"]:
+                        sel = st.selectbox(
+                            f"Coluna para '{campo}'", all_cols,
+                            key=f"manual_col_{campo}",
+                        )
+                        if sel != "-- ignorar --":
+                            manual_map[sel] = campo
+                    if st.button("Aplicar Mapeamento Manual", use_container_width=True):
+                        df_mapped = df.rename(columns=manual_map)
+                        tem_coords = "lat" in df_mapped.columns and "lon" in df_mapped.columns
+                        tem_end = "endereco" in df_mapped.columns
+
+                if tem_coords or tem_end:
+                    modo_imp = "coordenadas" if tem_coords else "geocodificar_end"
+                    if tem_coords and tem_end:
+                        modo_imp = st.radio(
+                            "Como importar?",
+                            ["Usar coordenadas (lat/lon)", "Geocodificar pelo endereço"],
+                            horizontal=True, key="modo_imp",
+                        )
+                        modo_imp = "coordenadas" if "lat" in modo_imp else "geocodificar_end"
+
+                    if st.button("📥 Importar Agora", type="primary", use_container_width=True):
+                        pontos_importados = []
+                        erros = []
+                        if modo_imp == "coordenadas":
+                            for _, row in df_mapped.iterrows():
+                                try:
+                                    lat_v = float(str(row["lat"]).replace(",", "."))
+                                    lon_v = float(str(row["lon"]).replace(",", "."))
+                                    if not (-90 <= lat_v <= 90 and -180 <= lon_v <= 180):
+                                        erros.append(f"Coord inválida: {lat_v},{lon_v}")
+                                        continue
+                                    pontos_importados.append({
+                                        "lat": lat_v, "lon": lon_v,
+                                        "nome": str(row.get("nome", row.get("endereco", f"Ponto {len(pontos_importados)+1}"))),
+                                        "endereco": str(row.get("endereco", "")),
+                                        "obs": str(row.get("obs", "")),
+                                        "prioridade": str(row.get("prioridade", "Normal")),
+                                        "telefone": str(row.get("telefone", "")),
+                                        "cep": str(row.get("cep", "")),
+                                    })
+                                except Exception as ex:
+                                    erros.append(str(ex))
+                        else:
+                            # Geocodifica pelo endereço com barra de progresso
+                            registros = df_mapped.to_dict("records")
+                            pb = st.progress(0, "Geocodificando endereços…")
+                            def _prog_imp(i, total, end):
+                                pb.progress((i+1)/max(total,1), f"Geocodificando: {end[:40]}…")
+                            resultados = geocodificar_em_lote(registros, _prog_imp)
+                            pb.empty()
+                            for r in resultados:
+                                if r.get("_geocodificado"):
+                                    r.pop("_geocodificado", None)
+                                    r.pop("_erro", None)
+                                    pontos_importados.append(r)
+                                else:
+                                    erros.append(f"{r.get('endereco','?')}: {r.get('_erro','falhou')}")
+
+                        if pontos_importados:
+                            modo_add = st.radio(
+                                "Adicionar os pontos:", ["Substituir todos", "Adicionar aos existentes"],
+                                horizontal=True, key="modo_add_imp",
+                            ) if st.session_state.pontos_coleta else "Substituir todos"
+                            if modo_add == "Substituir todos":
+                                st.session_state.pontos_coleta = pontos_importados
+                                st.session_state.atribuicao_motorista = {}
+                            else:
+                                st.session_state.pontos_coleta.extend(pontos_importados)
+                            st.success(f"✅ {len(pontos_importados)} pontos importados!")
+                            if erros:
+                                st.warning(f"⚠️ {len(erros)} erros: {'; '.join(erros[:3])}")
+                            st.rerun()
+                        else:
+                            st.error(f"Nenhum ponto importado. Erros: {'; '.join(erros[:5])}")
             except Exception as e:
-                st.error(f"Erro: {e}")
+                st.error(f"Erro ao processar arquivo: {e}")
+
+        # Template para download
+        with st.expander("📄 Baixar modelo de planilha"):
+            template_df = pd.DataFrame([
+                {"nome": "Exemplo Loja A", "endereco": "Rua 14, 123, Setor Central, Goiânia",
+                 "lat": -16.6786, "lon": -49.2559, "obs": "Portaria lateral", "prioridade": "Normal"},
+                {"nome": "Exemplo Loja B", "endereco": "Av. Goiás, 456, Centro, Goiânia",
+                 "lat": -16.680, "lon": -49.253, "obs": "", "prioridade": "Alta"},
+            ])
+            t1, t2 = st.columns(2)
+            with t1:
+                st.download_button("CSV Modelo", template_df.to_csv(index=False),
+                                   "modelo_pontos.csv", "text/csv", use_container_width=True)
+            with t2:
+                buf_t = io.BytesIO()
+                template_df.to_excel(buf_t, index=False)
+                st.download_button("Excel Modelo", buf_t.getvalue(),
+                                   "modelo_pontos.xlsx",
+                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
 
     with st.expander("Bairros (GeoJSON)"):
         arquivo_geojson = st.file_uploader(
@@ -2139,61 +2255,224 @@ with tab_motoristas:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB BAIRROS
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Cores por região
+CORES_REGIOES = {
+    "Central":   "#e74c3c", "Norte":    "#3498db", "Sul":      "#2ecc71",
+    "Leste":     "#f39c12", "Oeste":    "#9b59b6", "Noroeste": "#1abc9c",
+    "Nordeste":  "#e67e22", "Sudoeste": "#e84393", "Sudeste":  "#6c5ce7",
+}
+ICON_REGIOES = {
+    "Central":"🏙️","Norte":"⬆️","Sul":"⬇️","Leste":"➡️","Oeste":"⬅️",
+    "Noroeste":"↖️","Nordeste":"↗️","Sudoeste":"↙️","Sudeste":"↘️",
+}
+
 with tab_bairros:
-    st.markdown('<div class="section-title">Selecao de Bairros</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-subtitle">Selecione bairros e atribua cores diferentes para visualizar no mapa</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Bairros de Goiânia</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">328 bairros com divisão por região • Busca por nome, CEP ou rua</div>', unsafe_allow_html=True)
 
     if geojson_bairros and geojson_bairros.get("features"):
-        nomes_bairros = sorted(set(
-            _get_bairro_nome(f) for f in geojson_bairros["features"]
-        ))
 
-        # Cores disponiveis
-        st.caption(f"{len(nomes_bairros)} bairros disponiveis | {len(st.session_state.bairros_selecionados)} selecionados")
+        # ── Monta mapa nome→região a partir do GeoJSON ─────────────────────
+        nome_para_regiao = {}
+        for feat in geojson_bairros["features"]:
+            nm = _get_bairro_nome(feat)
+            rg = feat.get("properties", {}).get("regiao", "Central")
+            nome_para_regiao[nm] = rg
 
-        # Legenda de cores
-        leg = ""
-        for ci, cor in enumerate(CORES_BAIRROS):
-            leg += f'<span class="bairro-chip" style="background:{cor}22;border-color:{cor};color:{cor}">{ci+1}</span>'
-        st.markdown(f"**Paleta de cores:** {leg}", unsafe_allow_html=True)
+        todas_regioes = ["Todas"] + sorted(CORES_REGIOES.keys())
+        nomes_bairros_todos = sorted(nome_para_regiao.keys())
+
+        # ── Busca universal ─────────────────────────────────────────────────
+        st.markdown("### 🔍 Busca Universal")
+        busca_col1, busca_col2 = st.columns([3, 1])
+        with busca_col1:
+            busca_texto = st.text_input(
+                "Buscar por nome do bairro, rua ou logradouro",
+                placeholder="Ex: Setor Bueno   |   Rua 14   |   Jardim América",
+                key="busca_universal",
+            )
+        with busca_col2:
+            cep_input = st.text_input(
+                "Buscar por CEP", placeholder="74000-000",
+                key="busca_cep",
+            )
+
+        # Busca por CEP (ViaCEP)
+        if cep_input:
+            cep_limpo = cep_input.strip().replace("-", "").replace(".", "").replace(" ", "")
+            if len(cep_limpo) == 8 and cep_limpo.isdigit():
+                try:
+                    import urllib.request
+                    with urllib.request.urlopen(
+                        f"https://viacep.com.br/ws/{cep_limpo}/json/", timeout=5
+                    ) as resp:
+                        cep_data = json.loads(resp.read().decode())
+                    if "erro" not in cep_data:
+                        bairro_cep = cep_data.get("bairro", "")
+                        logr_cep = cep_data.get("logradouro", "")
+                        cidade_cep = cep_data.get("localidade", "")
+                        st.success(
+                            f"📮 **CEP {cep_input}** → {logr_cep}, {bairro_cep}, {cidade_cep}"
+                        )
+                        # Tenta geocodificar e adicionar ponto
+                        cep_col1, cep_col2 = st.columns(2)
+                        with cep_col1:
+                            if st.button("📍 Adicionar como ponto de coleta", key="add_cep"):
+                                loc = geocodificar(f"{logr_cep}, {bairro_cep}, {cidade_cep}")
+                                if loc:
+                                    st.session_state.pontos_coleta.append({
+                                        "lat": loc["lat"], "lon": loc["lon"],
+                                        "nome": bairro_cep or logr_cep,
+                                        "endereco": f"{logr_cep}, {bairro_cep}",
+                                        "obs": f"CEP {cep_input}", "prioridade": "Normal",
+                                    })
+                                    st.success(f"Ponto adicionado!")
+                                    st.rerun()
+                                else:
+                                    st.warning("Não foi possível geocodificar o CEP.")
+                        with cep_col2:
+                            # Filtra bairros pelo nome retornado pelo CEP
+                            if bairro_cep:
+                                matches = [b for b in nomes_bairros_todos if bairro_cep.lower() in b.lower()]
+                                if matches:
+                                    st.info(f"Bairros compatíveis: {', '.join(matches[:5])}")
+                    else:
+                        st.error("CEP não encontrado.")
+                except Exception as e:
+                    st.warning(f"Erro ao consultar CEP: {e}")
+            elif cep_limpo:
+                st.warning("CEP inválido. Digite 8 dígitos.")
+
+        # Busca por rua/logradouro via Nominatim
+        if busca_texto and len(busca_texto) > 3:
+            # Verifica se parece uma rua (começa com "Rua", "Av", etc.)
+            parece_rua = any(busca_texto.lower().startswith(p) for p in
+                             ["rua", "av", "r.", "avenida", "alameda", "travessa", "setor", "qd", "quadra"])
+            if parece_rua:
+                if st.button(f"🗺️ Geocodificar '{busca_texto}'", key="geocod_rua"):
+                    loc = geocodificar(busca_texto)
+                    if loc:
+                        st.success(f"Encontrado: lat={loc['lat']:.6f}, lon={loc['lon']:.6f}")
+                        if st.button("Adicionar como ponto", key="add_rua"):
+                            st.session_state.pontos_coleta.append({
+                                "lat": loc["lat"], "lon": loc["lon"],
+                                "nome": busca_texto, "endereco": busca_texto,
+                                "obs": "", "prioridade": "Normal",
+                            })
+                            st.rerun()
+                    else:
+                        st.warning("Endereço não encontrado. Tente adicionar 'Goiânia, GO'.")
 
         st.divider()
 
-        # Busca
-        busca = st.text_input("Buscar bairro", placeholder="Digite o nome do bairro...", key="busca_bairro")
+        # ── Filtro por Região ─────────────────────────────────────────────
+        st.markdown("### 🗺️ Divisões Regionais de Goiânia")
 
-        bairros_filtrados = [b for b in nomes_bairros if busca.lower() in b.lower()] if busca else nomes_bairros
+        # KPI por região
+        contagem_regioes = {}
+        for nm, rg in nome_para_regiao.items():
+            contagem_regioes[rg] = contagem_regioes.get(rg, 0) + 1
 
-        # Acoes em massa
-        ac1, ac2, ac3 = st.columns(3)
+        reg_chips = ""
+        for rg in sorted(CORES_REGIOES.keys()):
+            cor = CORES_REGIOES[rg]
+            ico = ICON_REGIOES.get(rg, "")
+            n_b = contagem_regioes.get(rg, 0)
+            reg_chips += (
+                f'<span class="bairro-chip" style="background:{cor}22;border-color:{cor};color:{cor}">'
+                f'{ico} {rg} ({n_b})</span>'
+            )
+        st.markdown(reg_chips, unsafe_allow_html=True)
+
+        regiao_filtro = st.selectbox(
+            "Filtrar por região", todas_regioes, key="filtro_regiao",
+        )
+
+        # Filtro por texto + região combinados
+        bairros_filtrados = []
+        for b in nomes_bairros_todos:
+            if busca_texto and busca_texto.lower() not in b.lower():
+                continue
+            if regiao_filtro != "Todas" and nome_para_regiao.get(b) != regiao_filtro:
+                continue
+            bairros_filtrados.append(b)
+
+        n_filt = len(bairros_filtrados)
+        n_sel = len(st.session_state.bairros_selecionados)
+        st.caption(f"Exibindo {n_filt} de {len(nomes_bairros_todos)} bairros • {n_sel} selecionados")
+
+        # ── Ações em massa ─────────────────────────────────────────────────
+        ac1, ac2, ac3, ac4 = st.columns(4)
         with ac1:
-            if st.button("Selecionar Todos", use_container_width=True):
-                for i, b in enumerate(nomes_bairros):
-                    if b not in st.session_state.bairros_selecionados:
-                        st.session_state.bairros_selecionados[b] = i % len(CORES_BAIRROS)
+            if st.button("✅ Selecionar Região Atual", use_container_width=True):
+                for i, b in enumerate(bairros_filtrados):
+                    rg = nome_para_regiao.get(b, "Central")
+                    cor_idx = list(CORES_REGIOES.keys()).index(rg) if rg in CORES_REGIOES else 0
+                    st.session_state.bairros_selecionados[b] = cor_idx % len(CORES_BAIRROS)
                 st.rerun()
         with ac2:
-            if st.button("Limpar Selecao", use_container_width=True):
-                st.session_state.bairros_selecionados = {}
+            if st.button("🎨 Colorir por Região", use_container_width=True,
+                         help="Cada região fica com uma cor diferente"):
+                for b in nomes_bairros_todos:
+                    rg = nome_para_regiao.get(b, "Central")
+                    cor_idx = list(CORES_REGIOES.keys()).index(rg) if rg in CORES_REGIOES else 0
+                    st.session_state.bairros_selecionados[b] = cor_idx % len(CORES_BAIRROS)
                 st.rerun()
         with ac3:
-            if st.button("Cores Automaticas", use_container_width=True, help="Atribui cores sequenciais"):
+            if st.button("🗑️ Limpar Seleção", use_container_width=True):
+                st.session_state.bairros_selecionados = {}
+                st.rerun()
+        with ac4:
+            if st.button("🔢 Cores Automáticas", use_container_width=True):
                 for i, b in enumerate(st.session_state.bairros_selecionados.keys()):
                     st.session_state.bairros_selecionados[b] = i % len(CORES_BAIRROS)
                 st.rerun()
 
         st.divider()
 
-        # Lista de bairros com checkbox e cor
+        # ── Lista paginada de bairros ───────────────────────────────────────
+        PAGE_SIZE = 40
+        total_pages = max(1, (n_filt + PAGE_SIZE - 1) // PAGE_SIZE)
+        if f"bairros_page_{regiao_filtro}" not in st.session_state:
+            st.session_state[f"bairros_page_{regiao_filtro}"] = 0
+        page_key = f"bairros_page_{regiao_filtro}"
+        if busca_texto:
+            st.session_state[page_key] = 0
+
+        pg_col1, pg_col2, pg_col3 = st.columns([1, 3, 1])
+        with pg_col1:
+            if st.button("◀ Anterior", disabled=st.session_state[page_key] == 0, key="pg_prev"):
+                st.session_state[page_key] -= 1
+                st.rerun()
+        with pg_col2:
+            pg = st.session_state[page_key]
+            st.markdown(f"<center>Página {pg+1} de {total_pages}</center>", unsafe_allow_html=True)
+        with pg_col3:
+            if st.button("Próximo ▶", disabled=st.session_state[page_key] >= total_pages-1, key="pg_next"):
+                st.session_state[page_key] += 1
+                st.rerun()
+
+        inicio = st.session_state[page_key] * PAGE_SIZE
+        bairros_pagina = bairros_filtrados[inicio: inicio + PAGE_SIZE]
+
         nova_sel = dict(st.session_state.bairros_selecionados)
-        for b_nome in bairros_filtrados:
-            is_sel = b_nome in st.session_state.bairros_selecionados
-            bc1, bc2 = st.columns([3, 1])
+        for b_nome in bairros_pagina:
+            rg = nome_para_regiao.get(b_nome, "Central")
+            cor_rg = CORES_REGIOES.get(rg, "#95a5a6")
+            is_sel = b_nome in nova_sel
+            bc1, bc2, bc3 = st.columns([3, 1, 1])
             with bc1:
                 checked = st.checkbox(
                     b_nome, value=is_sel, key=f"bairro_cb_{b_nome}",
                 )
             with bc2:
+                st.markdown(
+                    f'<span class="bairro-chip" style="background:{cor_rg}22;border-color:{cor_rg};'
+                    f'color:{cor_rg};font-size:.7rem">{ICON_REGIOES.get(rg,"")} {rg}</span>',
+                    unsafe_allow_html=True,
+                )
+            with bc3:
                 if checked:
                     cor_idx = st.selectbox(
                         "Cor", options=list(range(len(CORES_BAIRROS))),
@@ -2206,20 +2485,21 @@ with tab_bairros:
                 else:
                     nova_sel.pop(b_nome, None)
 
-        if st.button("Aplicar Selecao de Bairros", type="primary", use_container_width=True):
+        if st.button("✅ Aplicar Seleção de Bairros", type="primary", use_container_width=True):
             st.session_state.bairros_selecionados = nova_sel
             st.rerun()
 
-        # Bairros selecionados
+        # ── Bairros selecionados ────────────────────────────────────────────
         if st.session_state.bairros_selecionados:
             st.markdown('<div class="section-title">Bairros Selecionados</div>', unsafe_allow_html=True)
             chips = ""
-            for b_nome, cor_idx in st.session_state.bairros_selecionados.items():
+            for b_nome, cor_idx in list(st.session_state.bairros_selecionados.items())[:60]:
                 cor = CORES_BAIRROS[cor_idx % len(CORES_BAIRROS)]
                 chips += f'<span class="bairro-chip" style="background:{cor}22;border-color:{cor};color:{cor}">{b_nome}</span>'
+            if len(st.session_state.bairros_selecionados) > 60:
+                chips += f'<span class="bairro-chip" style="background:#eee;border-color:#ccc;color:#666">+{len(st.session_state.bairros_selecionados)-60} mais...</span>'
             st.markdown(chips, unsafe_allow_html=True)
 
-            # Pontos por bairro
             if st.session_state.pontos_coleta:
                 st.markdown('<div class="section-title">Pontos por Bairro Selecionado</div>', unsafe_allow_html=True)
                 bairro_contagem = {}
@@ -2228,12 +2508,14 @@ with tab_bairros:
                     if b in st.session_state.bairros_selecionados:
                         bairro_contagem[b] = bairro_contagem.get(b, 0) + 1
                 if bairro_contagem:
-                    df_bc = pd.DataFrame([{"Bairro": k, "Pontos": v} for k, v in sorted(bairro_contagem.items(), key=lambda x: -x[1])])
+                    df_bc = pd.DataFrame([{"Bairro": k, "Região": nome_para_regiao.get(k,"?"),
+                                           "Pontos": v}
+                                          for k, v in sorted(bairro_contagem.items(), key=lambda x: -x[1])])
                     st.dataframe(df_bc, use_container_width=True, hide_index=True)
                 else:
                     st.info("Nenhum ponto nos bairros selecionados.")
     else:
-        st.info("Importe um arquivo GeoJSON de bairros na barra lateral para usar esta funcao.")
+        st.info("Importe um arquivo GeoJSON de bairros na barra lateral para usar esta função.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
